@@ -14,55 +14,54 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Python
-        uses: actions/setup-python@v7
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: |
             app/requirements.txt
             requirements-dev.txt
-      - name: Install dependencies
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           python -m pip install -r app/requirements.txt -r requirements-dev.txt
-      - name: Pylint
-        run: python -m pylint app --score=no
+      - run: python -m pylint app --score=no
   test:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Python
-        uses: actions/setup-python@v7
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: |
             app/requirements.txt
             requirements-dev.txt
-      - name: Install dependencies
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           python -m pip install -r app/requirements.txt -r requirements-dev.txt
-      - name: Unit tests
-        run: python -m pytest -q
-  image:
+      - run: python -m pytest -q
+  image-build:
     needs: test
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Normalize image name
-        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
-      - name: Build image
-        run: docker build --tag "devops-ci-app:${GITHUB_SHA}" .
+      - uses: actions/checkout@v7
+      - name: Build image on its native architecture
+        run: |
+          test "$(dpkg --print-architecture)" = "${{ matrix.arch }}"
+          docker build --tag "devops-ci-app:${GITHUB_SHA}" .
       - name: Smoke-test container
         run: |
           set -euo pipefail
@@ -85,7 +84,6 @@ jobs:
             echo "::error::/health did not respond after 15 attempts"
             exit 1
           fi
-          python3 -m json.tool health.json
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -93,30 +91,45 @@ jobs:
           assert payload == {"status": "ok"}, f"unexpected /health payload: {payload}"
           PY
           docker exec smoke id
-      - name: Tag registry image
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-        run: |
-          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-            docker tag "devops-ci-app:${GITHUB_SHA}" "${IMAGE_NAME}:${GITHUB_SHA}"
-            docker tag "devops-ci-app:${GITHUB_SHA}" "${IMAGE_NAME}:latest"
-          else
-            VERSION="${GITHUB_REF_NAME#v}"
-            docker tag "devops-ci-app:${GITHUB_SHA}" "${IMAGE_NAME}:${VERSION}"
-          fi
       - name: Log in to GHCR
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        if: github.event_name == 'push'
         env:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s\n' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-      - name: Push image
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+      - name: Push tested platform image
+        if: github.event_name == 'push'
+        run: |
+          IMAGE_NAME="${IMAGE_NAME,,}"
+          docker tag "devops-ci-app:${GITHUB_SHA}" "${IMAGE_NAME}:${GITHUB_SHA}-${{ matrix.arch }}"
+          docker push "${IMAGE_NAME}:${GITHUB_SHA}-${{ matrix.arch }}"
+  image:
+    needs: image-build
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo 'Both native architecture builds and smoke tests passed.'
+  publish:
+    if: github.event_name == 'push'
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s\n' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Publish multi-platform image index
         run: |
           set -euo pipefail
+          IMAGE_NAME="${IMAGE_NAME,,}"
+          TAGS=(-t "${IMAGE_NAME}:${GITHUB_SHA}")
           if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
-            docker push "${IMAGE_NAME}:${GITHUB_SHA}" | tee push-sha.log
-            docker push "${IMAGE_NAME}:latest" | tee push-alias.log
-          else
-            VERSION="${GITHUB_REF_NAME#v}"
-            docker push "${IMAGE_NAME}:${VERSION}" | tee push-alias.log
+            TAGS+=(-t "${IMAGE_NAME}:latest")
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAGS+=(-t "${IMAGE_NAME}:${GITHUB_REF_NAME#v}")
           fi
-          grep -E 'digest: sha256:' push-*.log
+          docker buildx imagetools create "${TAGS[@]}" \
+            "${IMAGE_NAME}:${GITHUB_SHA}-amd64" \
+            "${IMAGE_NAME}:${GITHUB_SHA}-arm64"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${GITHUB_SHA}"
